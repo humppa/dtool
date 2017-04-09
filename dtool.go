@@ -1,18 +1,13 @@
 // dtool, Copyright (c) 2017 Tuomas Starck
 
-/* TODO
- * use https://golang.org/pkg/os/#Chdir
- * build a map https://blog.golang.org/go-maps-in-action for quick lookup
- * serialize/deserialize the map: https://golang.org/pkg/encoding/json/
- * figure out some way to compare and find matches
- */
-
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,78 +22,148 @@ type result struct {
 }
 
 const (
-	dhashMagicValue    = 8
-	defaultParallelism = 1
-	usageParallel      = "Max number of parallel jobs"
+	dhashMagicValue = 8
+	cacheFilename   = ".hashcache"
+	usageParallel   = "Max number of parallel jobs"
+	usageVerbose    = "Print hash for each new file"
 )
 
 var parallel int
+var verbose bool
 
 func init() {
-	flag.IntVar(&parallel, "j", defaultParallelism, usageParallel)
+	runtime.GOMAXPROCS(parallel)
+	log.SetFlags(log.Lshortfile)
+	flag.IntVar(&parallel, "j", 1, usageParallel)
+	flag.BoolVar(&verbose, "v", false, usageVerbose)
 }
 
-func getFileOrDir(unknown string) (ret []string) {
+func chdir(unknown string) {
 	stat, err := os.Stat(unknown)
 
 	if err != nil {
-		// Catch if unknown does not exists and any other error
-		fmt.Fprintf(os.Stderr, "err: '%s': %s\n", unknown, err.Error())
-		os.Exit(1)
+		// Catch if 'unknown' does not exists or any other IO error
+		log.Fatal(err.Error())
 	} else if stat.IsDir() {
 		dir := filepath.Clean(unknown)
-
-		files, err := ioutil.ReadDir(dir)
-
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "err: %s\n", err.Error())
-			os.Exit(1)
-		}
-
-		for _, f := range files {
-			if !f.IsDir() && filepath.Ext(f.Name()) == ".jpg" {
-				ret = append(ret, filepath.Clean(filepath.Join(dir, f.Name())))
-			}
-		}
+		os.Chdir(dir)
 	} else {
-		ret = append(ret, filepath.Clean(unknown))
+		log.Fatalf("not a directory: %s", unknown)
 	}
 
 	return
 }
 
-func process(files []string) {
-	var n int = len(files)
+func readCache() (ret map[string]string) {
+	ret = make(map[string]string)
 
-	queue := make(chan result, parallel)
+	cache, err := ioutil.ReadFile(cacheFilename)
+
+	if err != nil {
+		// Fail silently if cache does not exist
+		return
+	}
+
+	err = json.Unmarshal(cache, &ret)
+
+	if err != nil {
+		log.Fatal("unmarshal: cache might be corrupted")
+	}
+
+	return
+}
+
+func getDirContents(hashmap map[string]string) (ret []string) {
+	files, err := ioutil.ReadDir(".")
+
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+
+	filetypes := map[string]bool{
+		".jpg": true,
+		".png": true,
+	}
+
+	for _, f := range files {
+		if !f.IsDir() {
+			if _, ok := filetypes[filepath.Ext(f.Name())]; ok {
+				if _, ok := hashmap[f.Name()]; !ok {
+					ret = append(ret, f.Name())
+				}
+			}
+		}
+	}
+
+	return
+}
+
+func checkDuplicates(hashmap map[string]string) {
+	lookup := make(map[string]string)
+
+	for path, hash := range hashmap {
+		if fn, ok := lookup[hash]; ok {
+			fmt.Println(hash, fn, "<>", path)
+		}
+		lookup[hash] = path
+	}
+}
+
+func writeCache(hashmap map[string]string) {
+	bytes, err := json.Marshal(hashmap)
+
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+
+	err = ioutil.WriteFile(cacheFilename, bytes, 0644)
+
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+}
+
+func process() {
+	hashmap := readCache()
+	files := getDirContents(hashmap)
+	semaphore := make(chan struct{}, parallel)
+	msg := make(chan result)
+	n := len(files)
 
 	for _, path := range files {
 		go func(path string) {
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 			hash, err := dhash.Dhash(path, dhashMagicValue)
-			queue <- result{err, hash, path}
+			msg <- result{err, hash, path}
 		}(path)
 	}
 
 	for i := 0; i < n; i++ {
-		res := <-queue
-
-		if res.err == nil {
-			fmt.Println(res.hash, res.path)
+		if res := <-msg; res.err == nil {
+			hashmap[res.path] = res.hash
+			if verbose {
+				fmt.Println(res.hash, res.path)
+			}
 		} else {
 			fmt.Fprintf(os.Stderr, "err: '%s': %s\n", res.path, res.err.Error())
 		}
 	}
+
+	checkDuplicates(hashmap)
+
+	writeCache(hashmap)
 }
 
 func main() {
 	flag.Parse()
-	runtime.GOMAXPROCS(parallel)
 
 	// Rest of the arguments after doubledash
 	// i.e. after 'flag' has stopped parsing
 	argv := os.Args[len(os.Args)-flag.NArg():]
 
-	for _, x := range argv {
-		process(getFileOrDir(x))
+	for _, path := range argv {
+		chdir(path)
+		process()
 	}
 }
