@@ -3,12 +3,17 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 
@@ -21,21 +26,31 @@ type result struct {
 	path string
 }
 
+type fileinfo struct {
+	size int64
+	res  string
+	md5  string
+	name string
+}
+
 const (
 	dhashMagicValue = 8
 	cacheFilename   = ".hashcache"
 	usageParallel   = "Max number of parallel jobs"
 	usageVerbose    = "Print hash for each new file"
+	usageVisual     = "Show duplicate images with an image viewer"
 )
 
 var parallel int
 var verbose bool
+var visual bool
 
 func init() {
 	runtime.GOMAXPROCS(parallel)
 	log.SetFlags(log.Lshortfile)
 	flag.IntVar(&parallel, "j", 1, usageParallel)
 	flag.BoolVar(&verbose, "v", false, usageVerbose)
+	flag.BoolVar(&visual, "V", false, usageVisual)
 }
 
 func chdir(unknown string) {
@@ -98,14 +113,109 @@ func getDirContents(hashmap map[string]string) (ret []string) {
 	return
 }
 
+func getFileSize(filename string) (ret int64) {
+	if tmp, err := os.Stat(filename); err != nil {
+		log.Fatal(err)
+	} else {
+		ret = tmp.Size()
+	}
+
+	return
+}
+
+func getMD5(filename string) string {
+	f, err := os.Open(filename)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer f.Close()
+
+	h := md5.New()
+
+	if _, err := io.Copy(h, f); err != nil {
+		log.Fatal(err)
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func getImageResolution(filename string) (res string) {
+	f, err := os.Open(filename)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer f.Close()
+
+	if i, _, err := image.DecodeConfig(f); err != nil {
+		log.Fatal(err)
+	} else {
+		res = fmt.Sprintf("%dx%d", i.Width, i.Height)
+	}
+
+	return
+}
+
+func getFileInfo(filename string) fileinfo {
+	return fileinfo{
+		size: getFileSize(filename),
+		md5:  getMD5(filename),
+		res:  getImageResolution(filename),
+		name: filename,
+	}
+}
+
+func printInfo(i fileinfo) {
+	fmt.Printf("%8.2f kib %10s  MD5(%s)  %s\n", float64(i.size)/1024, i.res, i.md5, i.name)
+}
+
+func displayImages(f1 string, f2 string) {
+	viewer := os.Getenv("IMAGEVIEWER")
+	err := exec.Command(viewer, f1, f2).Run()
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func imageInfo(file1 string, file2 string) {
+	f1 := getFileInfo(file1)
+	f2 := getFileInfo(file2)
+
+	if f1.md5 == f2.md5 {
+		f1.md5 = "eq"
+		f2.md5 = "eq"
+	} else {
+		f1.md5 = f1.md5[:8]
+		f2.md5 = f2.md5[:8]
+	}
+
+	printInfo(f1)
+	printInfo(f2)
+}
+
+func notifyCollision(hash string, file1 string, file2 string) {
+	if visual {
+		imageInfo(file1, file2)
+		displayImages(file1, file2)
+		fmt.Println()
+	} else {
+		fmt.Println(hash, file1, file2)
+	}
+}
+
 func checkDuplicates(hashmap map[string]string) {
 	lookup := make(map[string]string)
 
-	for path, hash := range hashmap {
-		if fn, ok := lookup[hash]; ok {
-			fmt.Println(hash, fn, "<>", path)
+	for f2, hash := range hashmap {
+		if _, err := os.Stat(f2); os.IsNotExist(err) {
+			delete(hashmap, f2)
+		} else if f1, ok := lookup[hash]; ok {
+			notifyCollision(hash, f1, f2)
+			lookup[hash] = f2
+		} else {
+			lookup[hash] = f2
 		}
-		lookup[hash] = path
 	}
 }
 
@@ -149,6 +259,8 @@ func process() {
 			fmt.Fprintf(os.Stderr, "err: '%s': %s\n", res.path, res.err.Error())
 		}
 	}
+
+	writeCache(hashmap)
 
 	checkDuplicates(hashmap)
 
